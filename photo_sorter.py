@@ -352,7 +352,7 @@ class PhotoSorterApp(tk.Tk):
             self._next_photo()
             return
 
-        dst_dir = self.source_dir.parent / folder_name
+        dst_dir = self.source_dir / folder_name
         safe_move(src, dst_dir)
 
         self.sorted_count += 1
