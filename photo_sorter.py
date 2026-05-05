@@ -192,6 +192,8 @@ class PhotoSorterApp(tk.Tk):
         self.sorted_count: int = 0
         self.rules: list[dict] = []
         self._photo_image = None  # GC防止
+        self._toast_window: tk.Toplevel | None = None
+        self._toast_after_id = None
 
         self._build_ui()
         self.after(100, self._start)
@@ -359,7 +361,57 @@ class PhotoSorterApp(tk.Tk):
         self.photos.pop(self.current_index)
         if self.current_index >= len(self.photos) and self.current_index > 0:
             self.current_index -= 1
+        self._show_toast(f"→  {folder_name}")
         self._show_current()
+
+    def _show_toast(self, message: str):
+        # 既存のトーストがあれば閉じる
+        if self._toast_after_id is not None:
+            self.after_cancel(self._toast_after_id)
+            self._toast_after_id = None
+        if self._toast_window is not None:
+            try:
+                self._toast_window.destroy()
+            except tk.TclError:
+                pass
+
+        toast = tk.Toplevel(self)
+        toast.overrideredirect(True)
+        toast.attributes("-topmost", True)
+
+        label = tk.Label(
+            toast,
+            text=message,
+            font=("", 13, "bold"),
+            fg="white",
+            bg="#2e7d32",
+            padx=20,
+            pady=10,
+        )
+        label.pack()
+
+        # メインウィンドウの右下に配置
+        self.update_idletasks()
+        mw = self.winfo_x() + self.winfo_width()
+        mh = self.winfo_y() + self.winfo_height()
+        toast.update_idletasks()
+        tw = toast.winfo_width()
+        th = toast.winfo_height()
+        x = mw - tw - 24
+        y = mh - th - 48
+        toast.geometry(f"+{x}+{y}")
+
+        self._toast_window = toast
+        self._toast_after_id = self.after(1800, self._dismiss_toast)
+
+    def _dismiss_toast(self):
+        self._toast_after_id = None
+        if self._toast_window is not None:
+            try:
+                self._toast_window.destroy()
+            except tk.TclError:
+                pass
+            self._toast_window = None
 
     def _navigate(self, delta: int):
         if not self.photos:
