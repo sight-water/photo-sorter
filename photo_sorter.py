@@ -2,21 +2,37 @@
 Photo Sorter - キーボードショートカットで写真を素早く仕分けするツール
 """
 
-import os
 import json
 import shutil
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog, messagebox
 from pathlib import Path
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageTk, ImageOps
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 CONFIG_FILE = Path.home() / ".photo_sorter_config.json"
+
+# ── カラーパレット ──────────────────────────────────────
+BG_BASE    = "#111111"   # メインウィンドウ背景
+BG_SURFACE = "#1a1a1a"   # ツールバー・ステータスバー
+BG_RAISED  = "#232323"   # カード・入力欄
+BG_WIDGET  = "#2c2c2c"   # ボタン通常時
+BG_HOVER   = "#383838"   # ボタンホバー時
+BORDER_CLR = "#2e2e2e"   # 区切り線・ボーダー
+ACCENT     = "#3b82f6"   # 青アクセント
+ACCENT_HOV = "#60a5fa"   # 青アクセント（ホバー）
+SUCCESS    = "#22c55e"   # 緑（成功）
+AMBER      = "#f59e0b"   # 黄（キーバッジ）
+T_PRIMARY  = "#f0f0f0"   # 主テキスト
+T_SECONDARY= "#7a7a7a"   # 副テキスト
+T_MUTED    = "#404040"   # 薄テキスト
+CANVAS_BG  = "#090909"   # 画像表示エリア背景
+
 
 # ─────────────────────────────────────────────
 # 設定の読み書き
@@ -56,6 +72,32 @@ def safe_move(src: Path, dst_dir: Path) -> Path:
 
 
 # ─────────────────────────────────────────────
+# UIヘルパー
+# ─────────────────────────────────────────────
+
+def _make_btn(parent, text: str, command, accent: bool = False, **kw) -> tk.Label:
+    """ホバーエフェクト付きフラットボタン（Label実装）"""
+    n_bg = ACCENT if accent else BG_WIDGET
+    h_bg = ACCENT_HOV if accent else BG_HOVER
+    btn = tk.Label(
+        parent, text=text, cursor="hand2",
+        bg=n_bg, fg=T_PRIMARY, font=("", 9),
+        padx=12, pady=6, **kw
+    )
+    btn.bind("<Enter>",    lambda e: btn.config(bg=h_bg))
+    btn.bind("<Leave>",    lambda e: btn.config(bg=n_bg))
+    btn.bind("<Button-1>", lambda e: command())
+    return btn
+
+
+def _separator(parent, vertical: bool = False) -> tk.Frame:
+    """1px区切り線"""
+    if vertical:
+        return tk.Frame(parent, width=1, bg=BORDER_CLR)
+    return tk.Frame(parent, height=1, bg=BORDER_CLR)
+
+
+# ─────────────────────────────────────────────
 # 設定画面
 # ─────────────────────────────────────────────
 
@@ -64,75 +106,76 @@ class SettingsDialog(tk.Toplevel):
         super().__init__(parent)
         self.title("仕分けルールの設定")
         self.resizable(False, False)
+        self.configure(bg=BG_BASE)
         self.grab_set()
 
         self.result = None
         self.rows: list[tuple[tk.StringVar, tk.StringVar]] = []
 
-        # ─── ヘッダー ───
-        header = tk.Frame(self, bg="#2b2b2b", padx=16, pady=12)
-        header.pack(fill="x")
+        # ── ヘッダー ──
+        hdr = tk.Frame(self, bg=BG_SURFACE, padx=24, pady=18)
+        hdr.pack(fill="x")
         tk.Label(
-            header, text="仕分けルールを設定",
-            font=("", 14, "bold"), fg="white", bg="#2b2b2b"
+            hdr, text="仕分けルール設定",
+            font=("", 15, "bold"), fg=T_PRIMARY, bg=BG_SURFACE
         ).pack(anchor="w")
         tk.Label(
-            header, text="キー（1文字）とフォルダ名を最大9個まで登録できます",
-            font=("", 9), fg="#aaaaaa", bg="#2b2b2b"
-        ).pack(anchor="w")
+            hdr, text="キー（1文字） → 移動先フォルダ名を最大9個まで登録",
+            font=("", 9), fg=T_SECONDARY, bg=BG_SURFACE
+        ).pack(anchor="w", pady=(3, 0))
 
-        # ─── テーブル ───
-        body = tk.Frame(self, bg="#1e1e1e", padx=20, pady=16)
+        _separator(self).pack(fill="x")
+
+        # ── テーブル ──
+        body = tk.Frame(self, bg=BG_BASE, padx=24, pady=18)
         body.pack(fill="both")
 
-        tk.Label(body, text="キー", width=6, bg="#1e1e1e", fg="#888888").grid(
-            row=0, column=0, padx=4)
-        tk.Label(body, text="フォルダ名", width=24, bg="#1e1e1e", fg="#888888").grid(
-            row=0, column=1, padx=4)
+        tk.Label(body, text="キー", width=7, anchor="center",
+                 font=("", 9), fg=T_SECONDARY, bg=BG_BASE).grid(
+            row=0, column=0, padx=(0, 10), pady=(0, 6))
+        tk.Label(body, text="フォルダ名", anchor="w",
+                 font=("", 9), fg=T_SECONDARY, bg=BG_BASE).grid(
+            row=0, column=1, sticky="w", pady=(0, 6))
 
         existing = config.get("rules", [])
         for i in range(9):
-            key_var = tk.StringVar()
+            key_var  = tk.StringVar()
             name_var = tk.StringVar()
             if i < len(existing):
                 key_var.set(existing[i].get("key", ""))
                 name_var.set(existing[i].get("name", ""))
 
-            key_entry = tk.Entry(
+            key_e = tk.Entry(
                 body, textvariable=key_var, width=5,
-                bg="#2d2d2d", fg="white", insertbackground="white",
-                relief="flat", font=("", 11), justify="center"
+                bg=BG_RAISED, fg=T_PRIMARY, insertbackground=T_PRIMARY,
+                relief="flat", font=("Courier", 12, "bold"), justify="center",
+                highlightthickness=1,
+                highlightcolor=ACCENT, highlightbackground=BORDER_CLR
             )
-            key_entry.grid(row=i + 1, column=0, padx=4, pady=3, ipady=4)
-            key_entry.bind("<KeyRelease>", lambda e, v=key_var: self._limit_key(v))
+            key_e.grid(row=i + 1, column=0, padx=(0, 10), pady=3, ipady=7)
+            key_e.bind("<KeyRelease>", lambda e, v=key_var: self._limit_key(v))
 
-            name_entry = tk.Entry(
-                body, textvariable=name_var, width=26,
-                bg="#2d2d2d", fg="white", insertbackground="white",
-                relief="flat", font=("", 11)
+            name_e = tk.Entry(
+                body, textvariable=name_var, width=28,
+                bg=BG_RAISED, fg=T_PRIMARY, insertbackground=T_PRIMARY,
+                relief="flat", font=("", 11),
+                highlightthickness=1,
+                highlightcolor=ACCENT, highlightbackground=BORDER_CLR
             )
-            name_entry.grid(row=i + 1, column=1, padx=4, pady=3, ipady=4)
+            name_e.grid(row=i + 1, column=1, pady=3, ipady=7)
 
             self.rows.append((key_var, name_var))
 
-        # ─── ボタン ───
-        footer = tk.Frame(self, bg="#1e1e1e", padx=20, pady=12)
+        # ── フッター ──
+        _separator(self).pack(fill="x")
+        footer = tk.Frame(self, bg=BG_SURFACE, padx=24, pady=14)
         footer.pack(fill="x")
 
-        tk.Button(
-            footer, text="キャンセル", command=self.destroy,
-            bg="#444444", fg="white", relief="flat",
-            padx=16, pady=6, cursor="hand2"
-        ).pack(side="right", padx=(8, 0))
+        _make_btn(footer, "キャンセル", self.destroy).pack(side="right", padx=(8, 0))
+        _make_btn(footer, "保存して開始", self._save, accent=True).pack(side="right")
 
-        tk.Button(
-            footer, text="保存して開始", command=self._save,
-            bg="#0078d4", fg="white", relief="flat",
-            padx=16, pady=6, cursor="hand2"
-        ).pack(side="right")
-
-        self.configure(bg="#1e1e1e")
-        self.center()
+        self.configure(bg=BG_BASE)
+        self._center()
 
     def _limit_key(self, var: tk.StringVar):
         v = var.get()
@@ -140,23 +183,21 @@ class SettingsDialog(tk.Toplevel):
             var.set(v[-1])
 
     def _save(self):
-        rules = []
-        seen_keys = set()
-        for key_var, name_var in self.rows:
-            k = key_var.get().strip()
-            n = name_var.get().strip()
+        rules, seen = [], set()
+        for kv, nv in self.rows:
+            k, n = kv.get().strip(), nv.get().strip()
             if not k and not n:
                 continue
             if not k:
-                messagebox.showerror("エラー", "キーが入力されていない行があります", parent=self)
+                messagebox.showerror("エラー", "キーが空の行があります", parent=self)
                 return
             if not n:
-                messagebox.showerror("エラー", "フォルダ名が入力されていない行があります", parent=self)
+                messagebox.showerror("エラー", "フォルダ名が空の行があります", parent=self)
                 return
-            if k in seen_keys:
+            if k in seen:
                 messagebox.showerror("エラー", f"キー「{k}」が重複しています", parent=self)
                 return
-            seen_keys.add(k)
+            seen.add(k)
             rules.append({"key": k, "name": n})
 
         if not rules:
@@ -166,11 +207,10 @@ class SettingsDialog(tk.Toplevel):
         self.result = rules
         self.destroy()
 
-    def center(self):
+    def _center(self):
         self.update_idletasks()
         w, h = self.winfo_width(), self.winfo_height()
-        sw = self.winfo_screenwidth()
-        sh = self.winfo_screenheight()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"+{(sw - w) // 2}+{(sh - h) // 2}")
 
 
@@ -182,101 +222,127 @@ class PhotoSorterApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Photo Sorter")
-        self.configure(bg="#1e1e1e")
-        self.minsize(800, 600)
+        self.configure(bg=BG_BASE)
+        self.minsize(860, 640)
 
         self.config_data = load_config()
         self.source_dir: Path | None = None
         self.photos: list[Path] = []
         self.current_index: int = 0
         self.sorted_count: int = 0
+        self._total_original: int = 0
         self.rules: list[dict] = []
-        self._photo_image = None  # GC防止
+        self._photo_image = None
         self._toast_window: tk.Toplevel | None = None
         self._toast_after_id = None
 
         self._build_ui()
         self.after(100, self._start)
 
-    # ─── UI構築 ───
+    # ── UI構築 ────────────────────────────────
 
     def _build_ui(self):
-        # ツールバー
-        toolbar = tk.Frame(self, bg="#2b2b2b", padx=10, pady=6)
+        # ── ツールバー ──────────────────────────
+        toolbar = tk.Frame(self, bg=BG_SURFACE, padx=16, pady=11)
         toolbar.pack(fill="x")
+
+        tk.Label(
+            toolbar, text="◈  Photo Sorter",
+            font=("", 12, "bold"), fg=T_PRIMARY, bg=BG_SURFACE
+        ).pack(side="left")
 
         self.folder_label = tk.Label(
             toolbar, text="フォルダ未選択",
-            font=("", 9), fg="#aaaaaa", bg="#2b2b2b", anchor="w"
+            font=("", 9), fg=T_SECONDARY, bg=BG_SURFACE, anchor="w"
         )
-        self.folder_label.pack(side="left", fill="x", expand=True)
+        self.folder_label.pack(side="left", padx=(14, 0), fill="x", expand=True)
 
-        tk.Button(
-            toolbar, text="⚙ ルール設定", command=self._open_settings,
-            bg="#3a3a3a", fg="white", relief="flat", padx=10, pady=2,
-            cursor="hand2", font=("", 9)
-        ).pack(side="right", padx=4)
+        _make_btn(toolbar, "⚙  ルール設定", self._open_settings).pack(
+            side="right", padx=(6, 0))
+        _make_btn(toolbar, "📂  フォルダ変更", self._change_folder).pack(
+            side="right", padx=(6, 0))
 
-        tk.Button(
-            toolbar, text="📂 フォルダ変更", command=self._change_folder,
-            bg="#3a3a3a", fg="white", relief="flat", padx=10, pady=2,
-            cursor="hand2", font=("", 9)
-        ).pack(side="right", padx=4)
-
-        # カウンター
-        self.counter_label = tk.Label(
-            self, text="",
-            font=("", 10), fg="#888888", bg="#1e1e1e"
+        # ── プログレスバー（3px線）──────────────
+        _separator(self).pack(fill="x")
+        self._prog_canvas = tk.Canvas(
+            self, height=3, bg=BG_SURFACE, highlightthickness=0
         )
-        self.counter_label.pack(pady=(8, 0))
+        self._prog_canvas.pack(fill="x")
 
-        # 画像表示エリア
-        self.canvas = tk.Canvas(
-            self, bg="#121212", highlightthickness=0
-        )
-        self.canvas.pack(fill="both", expand=True, padx=16, pady=8)
+        # ── 画像キャンバス ──────────────────────
+        self.canvas = tk.Canvas(self, bg=CANVAS_BG, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
 
-        # ファイル名
+        # ── ステータスバー（ファイル名・カウンタ）─
+        _separator(self).pack(fill="x")
+        status = tk.Frame(self, bg=BG_SURFACE, pady=10)
+        status.pack(fill="x")
+
         self.filename_label = tk.Label(
-            self, text="",
-            font=("", 10), fg="#cccccc", bg="#1e1e1e"
+            status, text="",
+            font=("", 11, "bold"), fg=T_PRIMARY, bg=BG_SURFACE
         )
         self.filename_label.pack()
 
-        # ショートカット一覧
-        self.shortcut_frame = tk.Frame(self, bg="#1e1e1e")
-        self.shortcut_frame.pack(pady=(4, 12))
-
-        # ナビゲーションヒント
-        nav_hint = tk.Label(
-            self,
-            text="← → : 前後の写真に移動（仕分けなし）　　ESC : 終了",
-            font=("", 9), fg="#555555", bg="#1e1e1e"
+        self.counter_label = tk.Label(
+            status, text="",
+            font=("", 9), fg=T_SECONDARY, bg=BG_SURFACE
         )
-        nav_hint.pack(pady=(0, 8))
+        self.counter_label.pack(pady=(2, 0))
+
+        # ── ショートカットバー ──────────────────
+        _separator(self).pack(fill="x")
+        self.shortcut_frame = tk.Frame(self, bg=BG_BASE, pady=10)
+        self.shortcut_frame.pack()
+
+        # ── ナビゲーションヒント ────────────────
+        _separator(self).pack(fill="x")
+        tk.Label(
+            self,
+            text="←  →  前後に移動（仕分けなし）　　ESC  終了",
+            font=("", 9), fg=T_MUTED, bg=BG_BASE, pady=7
+        ).pack()
 
     def _update_shortcut_bar(self):
         for w in self.shortcut_frame.winfo_children():
             w.destroy()
 
         for rule in self.rules:
-            cell = tk.Frame(self.shortcut_frame, bg="#2b2b2b", padx=8, pady=6)
-            cell.pack(side="left", padx=4)
+            # ボーダー枠（外枠 1px 効果）
+            outer = tk.Frame(self.shortcut_frame, bg=BORDER_CLR)
+            outer.pack(side="left", padx=5)
+            inner = tk.Frame(outer, bg=BG_RAISED, padx=14, pady=8)
+            inner.pack(padx=1, pady=1)
+
+            # キーラベル（黄）
             tk.Label(
-                cell,
-                text=f"[{rule['key']}]",
-                font=("Courier", 13, "bold"), fg="#f0c040", bg="#2b2b2b"
-            ).pack(side="left")
-            tk.Label(
-                cell,
-                text=f" {rule['name']}",
-                font=("", 11), fg="white", bg="#2b2b2b"
+                inner, text=rule["key"].upper(),
+                font=("Courier", 13, "bold"), fg=AMBER, bg=BG_RAISED,
+                width=2, anchor="center"
             ).pack(side="left")
 
-    # ─── 起動フロー ───
+            # フォルダ名
+            tk.Label(
+                inner, text=f"  {rule['name']}",
+                font=("", 10), fg=T_PRIMARY, bg=BG_RAISED
+            ).pack(side="left")
+
+    def _update_progress(self):
+        if self._total_original == 0:
+            return
+        self._prog_canvas.update_idletasks()
+        w = self._prog_canvas.winfo_width()
+        if w < 2:
+            return
+        ratio = self.sorted_count / self._total_original
+        self._prog_canvas.delete("all")
+        self._prog_canvas.create_rectangle(
+            0, 0, int(w * ratio), 3, fill=ACCENT, outline=""
+        )
+
+    # ── 起動フロー ────────────────────────────
 
     def _start(self):
-        # フォルダ選択
         folder = filedialog.askdirectory(title="仕分け元フォルダを選択してください")
         if not folder:
             self.destroy()
@@ -284,7 +350,6 @@ class PhotoSorterApp(tk.Tk):
         self.source_dir = Path(folder)
         self.folder_label.config(text=str(self.source_dir))
 
-        # 設定画面
         dlg = SettingsDialog(self, self.config_data)
         self.wait_window(dlg)
         if dlg.result is None:
@@ -308,6 +373,7 @@ class PhotoSorterApp(tk.Tk):
         self.folder_label.config(text=str(self.source_dir))
         self.sorted_count = 0
         self._load_photos()
+        self._update_progress()
         self._show_current()
 
     def _open_settings(self):
@@ -320,7 +386,7 @@ class PhotoSorterApp(tk.Tk):
             self._update_shortcut_bar()
             self._bind_keys()
 
-    # ─── 写真リスト ───
+    # ── 写真リスト ────────────────────────────
 
     def _load_photos(self):
         if not self.source_dir:
@@ -330,21 +396,22 @@ class PhotoSorterApp(tk.Tk):
             if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
         )
         self.current_index = 0
+        self._total_original = len(self.photos)
 
-    # ─── キーバインド ───
+    # ── キーバインド ──────────────────────────
 
     def _bind_keys(self):
         self.unbind_all("<Key>")
         for rule in self.rules:
             key = rule["key"]
             name = rule["name"]
-            self.bind(f"<KeyPress-{key}>", lambda e, n=name: self._sort_photo(n))
+            self.bind(f"<KeyPress-{key}>",        lambda e, n=name: self._sort_photo(n))
             self.bind(f"<KeyPress-{key.upper()}>", lambda e, n=name: self._sort_photo(n))
-        self.bind("<Left>", lambda e: self._navigate(-1))
-        self.bind("<Right>", lambda e: self._navigate(1))
+        self.bind("<Left>",   lambda e: self._navigate(-1))
+        self.bind("<Right>",  lambda e: self._navigate(1))
         self.bind("<Escape>", lambda e: self.destroy())
 
-    # ─── 仕分け操作 ───
+    # ── 仕分け操作 ────────────────────────────
 
     def _sort_photo(self, folder_name: str):
         if not self.photos or self.current_index >= len(self.photos):
@@ -361,11 +428,12 @@ class PhotoSorterApp(tk.Tk):
         self.photos.pop(self.current_index)
         if self.current_index >= len(self.photos) and self.current_index > 0:
             self.current_index -= 1
+
         self._show_toast(f"→  {folder_name}")
+        self._update_progress()
         self._show_current()
 
     def _show_toast(self, message: str):
-        # 既存のトーストがあれば閉じる
         if self._toast_after_id is not None:
             self.after_cancel(self._toast_after_id)
             self._toast_after_id = None
@@ -379,27 +447,18 @@ class PhotoSorterApp(tk.Tk):
         toast.overrideredirect(True)
         toast.attributes("-topmost", True)
 
-        label = tk.Label(
-            toast,
-            text=message,
-            font=("", 13, "bold"),
-            fg="white",
-            bg="#2e7d32",
-            padx=20,
-            pady=10,
-        )
-        label.pack()
+        tk.Label(
+            toast, text=message,
+            font=("", 12, "bold"), fg="white", bg=SUCCESS,
+            padx=18, pady=10
+        ).pack()
 
-        # メインウィンドウの右下に配置
         self.update_idletasks()
         mw = self.winfo_x() + self.winfo_width()
         mh = self.winfo_y() + self.winfo_height()
         toast.update_idletasks()
-        tw = toast.winfo_width()
-        th = toast.winfo_height()
-        x = mw - tw - 24
-        y = mh - th - 48
-        toast.geometry(f"+{x}+{y}")
+        tw, th = toast.winfo_width(), toast.winfo_height()
+        toast.geometry(f"+{mw - tw - 24}+{mh - th - 48}")
 
         self._toast_window = toast
         self._toast_after_id = self.after(1800, self._dismiss_toast)
@@ -426,7 +485,7 @@ class PhotoSorterApp(tk.Tk):
             self.current_index = max(0, len(self.photos) - 1)
         self._show_current()
 
-    # ─── 画像表示 ───
+    # ── 画像表示 ──────────────────────────────
 
     def _show_current(self):
         self.canvas.delete("all")
@@ -436,11 +495,10 @@ class PhotoSorterApp(tk.Tk):
             self._show_done()
             return
 
-        # カウンター更新
         total = len(self.photos)
         idx = self.current_index + 1
         self.counter_label.config(
-            text=f"{idx} / {total}  （仕分け済み: {self.sorted_count}枚）"
+            text=f"{idx} / {total}　　仕分け済み {self.sorted_count} 枚"
         )
 
         photo_path = self.photos[self.current_index]
@@ -462,15 +520,17 @@ class PhotoSorterApp(tk.Tk):
     def _show_with_pil(self, path: Path, cw: int, ch: int):
         try:
             img = Image.open(path)
+            img = ImageOps.exif_transpose(img)   # EXIF向き補正（縦撮り写真を正しく表示）
             img.thumbnail((cw, ch), Image.LANCZOS)
             self._photo_image = ImageTk.PhotoImage(img)
-            self.canvas.create_image(cw // 2, ch // 2, anchor="center",
-                                     image=self._photo_image)
+            self.canvas.create_image(
+                cw // 2, ch // 2, anchor="center", image=self._photo_image
+            )
         except Exception as e:
             self.canvas.create_text(
                 cw // 2, ch // 2,
                 text=f"画像を読み込めませんでした\n{e}",
-                fill="#888888", font=("", 12), justify="center"
+                fill=T_SECONDARY, font=("", 12), justify="center"
             )
 
     def _show_with_tk(self, path: Path, cw: int, ch: int):
@@ -478,19 +538,21 @@ class PhotoSorterApp(tk.Tk):
         if suffix not in {".png", ".gif"}:
             self.canvas.create_text(
                 cw // 2, ch // 2,
-                text="Pillowがインストールされていないため\nJPEG/WebPを表示できません\n\npip install Pillow",
-                fill="#888888", font=("", 12), justify="center"
+                text="Pillowがインストールされていないため\n"
+                     "JPEG/WebPを表示できません\n\npip install Pillow",
+                fill=T_SECONDARY, font=("", 12), justify="center"
             )
             return
         try:
             self._photo_image = tk.PhotoImage(file=str(path))
-            self.canvas.create_image(cw // 2, ch // 2, anchor="center",
-                                     image=self._photo_image)
+            self.canvas.create_image(
+                cw // 2, ch // 2, anchor="center", image=self._photo_image
+            )
         except Exception as e:
             self.canvas.create_text(
                 cw // 2, ch // 2,
                 text=f"画像を読み込めませんでした\n{e}",
-                fill="#888888", font=("", 12), justify="center"
+                fill=T_SECONDARY, font=("", 12), justify="center"
             )
 
     def _show_done(self):
@@ -502,8 +564,8 @@ class PhotoSorterApp(tk.Tk):
         ch = self.canvas.winfo_height()
         self.canvas.create_text(
             cw // 2, ch // 2,
-            text=f"✓  {self.sorted_count}枚の仕分けが完了しました",
-            fill="#4caf50", font=("", 18, "bold"), justify="center"
+            text=f"✓  {self.sorted_count} 枚の仕分けが完了しました",
+            fill=SUCCESS, font=("", 18, "bold"), justify="center"
         )
         messagebox.showinfo(
             "完了",
