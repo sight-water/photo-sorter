@@ -232,6 +232,7 @@ class PhotoSorterApp(tk.Tk):
         self.sorted_count: int = 0
         self._total_original: int = 0
         self.rules: list[dict] = []
+        self._undo_stack: list[dict] = []  # {"src": Path, "dst": Path, "index": int}
         self._photo_image = None
         self._toast_window: tk.Toplevel | None = None
         self._toast_after_id = None
@@ -299,7 +300,7 @@ class PhotoSorterApp(tk.Tk):
         _separator(self).pack(fill="x")
         tk.Label(
             self,
-            text="←  →  前後に移動（仕分けなし）　　ESC  終了",
+            text="←  →  前後に移動（仕分けなし）　　Ctrl+Z  元に戻す　　ESC  終了",
             font=("", 9), fg=T_MUTED, bg=BG_BASE, pady=7
         ).pack()
 
@@ -397,6 +398,7 @@ class PhotoSorterApp(tk.Tk):
         )
         self.current_index = 0
         self._total_original = len(self.photos)
+        self._undo_stack.clear()
 
     # ── キーバインド ──────────────────────────
 
@@ -407,9 +409,11 @@ class PhotoSorterApp(tk.Tk):
             name = rule["name"]
             self.bind(f"<KeyPress-{key}>",        lambda e, n=name: self._sort_photo(n))
             self.bind(f"<KeyPress-{key.upper()}>", lambda e, n=name: self._sort_photo(n))
-        self.bind("<Left>",   lambda e: self._navigate(-1))
-        self.bind("<Right>",  lambda e: self._navigate(1))
-        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Left>",      lambda e: self._navigate(-1))
+        self.bind("<Right>",     lambda e: self._navigate(1))
+        self.bind("<Control-z>", lambda e: self._undo_sort())
+        self.bind("<Control-Z>", lambda e: self._undo_sort())
+        self.bind("<Escape>",    lambda e: self.destroy())
 
     # ── 仕分け操作 ────────────────────────────
 
@@ -422,8 +426,9 @@ class PhotoSorterApp(tk.Tk):
             return
 
         dst_dir = self.source_dir / folder_name
-        safe_move(src, dst_dir)
+        dst = safe_move(src, dst_dir)
 
+        self._undo_stack.append({"src": src, "dst": dst, "index": self.current_index})
         self.sorted_count += 1
         self.photos.pop(self.current_index)
         if self.current_index >= len(self.photos) and self.current_index > 0:
@@ -432,6 +437,59 @@ class PhotoSorterApp(tk.Tk):
         self._show_toast(f"→  {folder_name}")
         self._update_progress()
         self._show_current()
+
+    def _undo_sort(self):
+        if not self._undo_stack:
+            return
+        entry = self._undo_stack.pop()
+        src: Path = entry["src"]
+        dst: Path = entry["dst"]
+        idx: int  = entry["index"]
+
+        if not dst.exists():
+            self._undo_stack.clear()
+            messagebox.showwarning("元に戻せません", "移動先のファイルが見つかりません。\n外部で変更された可能性があります。")
+            return
+
+        shutil.move(str(dst), str(src))
+
+        self.photos.insert(idx, src)
+        self.current_index = idx
+        self.sorted_count -= 1
+        self._update_progress()
+        self._show_toast_undo(f"↩  {src.name}")
+        self._show_current()
+
+    def _show_toast_undo(self, message: str):
+        """アンドゥ専用トースト（オレンジ色）"""
+        if self._toast_after_id is not None:
+            self.after_cancel(self._toast_after_id)
+            self._toast_after_id = None
+        if self._toast_window is not None:
+            try:
+                self._toast_window.destroy()
+            except tk.TclError:
+                pass
+
+        toast = tk.Toplevel(self)
+        toast.overrideredirect(True)
+        toast.attributes("-topmost", True)
+
+        tk.Label(
+            toast, text=message,
+            font=("", 12, "bold"), fg="white", bg="#d97706",
+            padx=18, pady=10
+        ).pack()
+
+        self.update_idletasks()
+        mw = self.winfo_x() + self.winfo_width()
+        mh = self.winfo_y() + self.winfo_height()
+        toast.update_idletasks()
+        tw, th = toast.winfo_width(), toast.winfo_height()
+        toast.geometry(f"+{mw - tw - 24}+{mh - th - 48}")
+
+        self._toast_window = toast
+        self._toast_after_id = self.after(1800, self._dismiss_toast)
 
     def _show_toast(self, message: str):
         if self._toast_after_id is not None:
