@@ -17,6 +17,10 @@ except ImportError:
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 CONFIG_FILE = Path.home() / ".photo_sorter_config.json"
 
+# Instagram portrait post (4:5 aspect ratio)
+INSTAGRAM_W = 1080
+INSTAGRAM_H = 1350
+
 # ── カラーパレット ──────────────────────────────────────
 BG_BASE    = "#111111"   # メインウィンドウ背景
 BG_SURFACE = "#1a1a1a"   # ツールバー・ステータスバー
@@ -215,6 +219,148 @@ class SettingsDialog(tk.Toplevel):
 
 
 # ─────────────────────────────────────────────
+# Instagram用リサイズ ダイアログ
+# ─────────────────────────────────────────────
+
+class ResizeProgressDialog(tk.Toplevel):
+    """Instagram portrait サイズへのバッチリサイズ進捗ダイアログ"""
+
+    def __init__(self, parent, photos: list, out_dir: Path):
+        super().__init__(parent)
+        self.title("Instagram用リサイズ")
+        self.resizable(False, False)
+        self.configure(bg=BG_BASE)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", lambda: None)  # 処理中は閉じない
+
+        self.photos = photos
+        self.out_dir = out_dir
+        self.current = 0
+        self.done_count = 0
+        self.error_count = 0
+        self.total = len(photos)
+
+        # ── ヘッダー ──
+        hdr = tk.Frame(self, bg=BG_SURFACE, padx=24, pady=18)
+        hdr.pack(fill="x")
+        tk.Label(
+            hdr, text="Instagram用にリサイズ中...",
+            font=("", 15, "bold"), fg=T_PRIMARY, bg=BG_SURFACE
+        ).pack(anchor="w")
+        tk.Label(
+            hdr, text=f"{INSTAGRAM_W} × {INSTAGRAM_H} px　元の比率を維持・余白は黒で埋める",
+            font=("", 9), fg=T_SECONDARY, bg=BG_SURFACE
+        ).pack(anchor="w", pady=(3, 0))
+
+        _separator(self).pack(fill="x")
+
+        # ── 本体 ──
+        body = tk.Frame(self, bg=BG_BASE, padx=24, pady=20)
+        body.pack(fill="both")
+
+        self._progress_label = tk.Label(
+            body, text=f"0 / {self.total}",
+            font=("", 11), fg=T_PRIMARY, bg=BG_BASE
+        )
+        self._progress_label.pack()
+
+        self._file_label = tk.Label(
+            body, text="",
+            font=("", 9), fg=T_SECONDARY, bg=BG_BASE, width=44, anchor="center"
+        )
+        self._file_label.pack(pady=(4, 12))
+
+        self._prog_canvas = tk.Canvas(
+            body, height=6, bg=BG_RAISED, highlightthickness=0
+        )
+        self._prog_canvas.pack(fill="x")
+
+        # ── フッター ──
+        _separator(self).pack(fill="x")
+        footer = tk.Frame(self, bg=BG_SURFACE, padx=24, pady=12)
+        footer.pack(fill="x")
+        tk.Label(
+            footer, text=f"保存先: {out_dir}",
+            font=("", 8), fg=T_SECONDARY, bg=BG_SURFACE
+        ).pack(anchor="w")
+
+        self._center()
+        self.after(50, self._process_next)
+
+    def _process_next(self):
+        if self.current >= self.total:
+            self.destroy()
+            return
+
+        photo = self.photos[self.current]
+        self._file_label.config(text=photo.name)
+
+        try:
+            self._resize_one(photo)
+            self.done_count += 1
+        except Exception:
+            self.error_count += 1
+
+        self.current += 1
+
+        ratio = self.current / self.total
+        self._progress_label.config(text=f"{self.current} / {self.total}")
+        self._prog_canvas.update_idletasks()
+        pw = self._prog_canvas.winfo_width()
+        self._prog_canvas.delete("all")
+        self._prog_canvas.create_rectangle(
+            0, 0, int(pw * ratio), 6, fill=ACCENT, outline=""
+        )
+
+        self.after(5, self._process_next)
+
+    def _resize_one(self, path: Path):
+        img = Image.open(path)
+        img = ImageOps.exif_transpose(img)
+
+        # アニメーションGIFは最初のフレームのみ使用
+        if getattr(img, "is_animated", False):
+            img.seek(0)
+
+        # RGB に統一（透明チャンネルは黒背景に合成）
+        if img.mode != "RGB":
+            base = Image.new("RGB", img.size, (0, 0, 0))
+            if img.mode == "RGBA":
+                base.paste(img, mask=img.split()[3])
+            else:
+                base.paste(img.convert("RGB"))
+            img = base
+
+        iw, ih = img.size
+        scale = min(INSTAGRAM_W / iw, INSTAGRAM_H / ih)
+        new_w = round(iw * scale)
+        new_h = round(ih * scale)
+
+        img_resized = img.resize((new_w, new_h), Image.LANCZOS)
+
+        canvas = Image.new("RGB", (INSTAGRAM_W, INSTAGRAM_H), (0, 0, 0))
+        x = (INSTAGRAM_W - new_w) // 2
+        y = (INSTAGRAM_H - new_h) // 2
+        canvas.paste(img_resized, (x, y))
+
+        out_path = self.out_dir / (path.stem + ".jpg")
+        if out_path.exists():
+            counter = 1
+            while out_path.exists():
+                out_path = self.out_dir / f"{path.stem}_{counter}.jpg"
+                counter += 1
+
+        # quality=95, subsampling=0 で高画質保存
+        canvas.save(out_path, "JPEG", quality=95, subsampling=0)
+
+    def _center(self):
+        self.update_idletasks()
+        w, h = self.winfo_width(), self.winfo_height()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"+{(sw - w) // 2}+{(sh - h) // 2}")
+
+
+# ─────────────────────────────────────────────
 # メインアプリ
 # ─────────────────────────────────────────────
 
@@ -261,6 +407,8 @@ class PhotoSorterApp(tk.Tk):
         _make_btn(toolbar, "⚙  ルール設定", self._open_settings).pack(
             side="right", padx=(6, 0))
         _make_btn(toolbar, "📂  フォルダ変更", self._change_folder).pack(
+            side="right", padx=(6, 0))
+        _make_btn(toolbar, "📸  Instagramリサイズ", self._resize_for_instagram).pack(
             side="right", padx=(6, 0))
 
         # ── プログレスバー（3px線）──────────────
@@ -386,6 +534,42 @@ class PhotoSorterApp(tk.Tk):
             save_config(self.config_data)
             self._update_shortcut_bar()
             self._bind_keys()
+
+    def _resize_for_instagram(self):
+        if not PIL_AVAILABLE:
+            messagebox.showerror(
+                "Pillowが必要です",
+                "この機能にはPillowが必要です。\n\n  pip install Pillow\n\nインストール後に再起動してください。"
+            )
+            return
+
+        folder = filedialog.askdirectory(title="リサイズする写真のフォルダを選択してください")
+        if not folder:
+            return
+        src_dir = Path(folder)
+
+        photos = sorted(
+            p for p in src_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+        )
+
+        if not photos:
+            messagebox.showinfo("対象なし", "対応する画像ファイルが見つかりませんでした。")
+            return
+
+        out_dir = src_dir / "instagram"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        dlg = ResizeProgressDialog(self, photos, out_dir)
+        self.wait_window(dlg)
+
+        if dlg.done_count > 0:
+            msg = f"{dlg.done_count}枚のリサイズが完了しました。\n\n保存先: {out_dir}"
+            if dlg.error_count > 0:
+                msg += f"\n\n※ {dlg.error_count}枚の処理に失敗しました"
+            messagebox.showinfo("完了", msg)
+        else:
+            messagebox.showwarning("エラー", "リサイズできたファイルがありませんでした。")
 
     # ── 写真リスト ────────────────────────────
 
