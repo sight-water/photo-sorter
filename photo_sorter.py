@@ -89,10 +89,12 @@ def _make_btn(parent, text: str, command, accent: bool = False, **kw) -> tk.Labe
     """ホバーエフェクト付きフラットボタン（Label実装）"""
     n_bg = ACCENT if accent else BG_WIDGET
     h_bg = ACCENT_HOV if accent else BG_HOVER
+    kw.setdefault("padx", 12)
+    kw.setdefault("pady", 6)
     btn = tk.Label(
         parent, text=text, cursor="hand2",
         bg=n_bg, fg=T_PRIMARY, font=("", 9),
-        padx=12, pady=6, **kw
+        **kw
     )
     btn.bind("<Enter>",    lambda e: btn.config(bg=h_bg))
     btn.bind("<Leave>",    lambda e: btn.config(bg=n_bg))
