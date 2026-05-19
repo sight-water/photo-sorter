@@ -14,6 +14,12 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
+try:
+    from send2trash import send2trash
+    TRASH_AVAILABLE = True
+except ImportError:
+    TRASH_AVAILABLE = False
+
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 CONFIG_FILE = Path.home() / ".photo_sorter_config.json"
 
@@ -83,10 +89,12 @@ def _make_btn(parent, text: str, command, accent: bool = False, **kw) -> tk.Labe
     """ホバーエフェクト付きフラットボタン（Label実装）"""
     n_bg = ACCENT if accent else BG_WIDGET
     h_bg = ACCENT_HOV if accent else BG_HOVER
+    kw.setdefault("padx", 12)
+    kw.setdefault("pady", 6)
     btn = tk.Label(
         parent, text=text, cursor="hand2",
         bg=n_bg, fg=T_PRIMARY, font=("", 9),
-        padx=12, pady=6, **kw
+        **kw
     )
     btn.bind("<Enter>",    lambda e: btn.config(bg=h_bg))
     btn.bind("<Leave>",    lambda e: btn.config(bg=n_bg))
@@ -383,25 +391,37 @@ class PhotoSorterApp(tk.Tk):
         self._toast_window: tk.Toplevel | None = None
         self._toast_after_id = None
 
-        # グリッド表示
+        # モザイク機能
+        self._mosaic_mode = False
+        self._mosaic_start: tuple[int, int] | None = None
+        self._mosaic_rect = None  # canvas上の選択矩形ID
+        self._mosaic_strength = tk.IntVar(value=20)  # ブロックサイズ: 10, 20, 40
+        self._display_info: tuple | None = None  # (scale, offset_x, offset_y, orig_w, orig_h)
+        self._mosaic_btn = None
+        self._mosaic_bar: tk.Frame | None = None
+
+        # トリミング機能
+        self._crop_mode = False
+        self._crop_start: tuple[int, int] | None = None
+        self._crop_rect = None  # canvas上の選択矩形ID
+        self._crop_btn = None
+        self._crop_bar: tk.Frame | None = None
+
+        # 評価・フラグ
+        self._ratings: dict = self.config_data.get("ratings", {})
+        self._star_labels: list[tk.Label] = []
+        self._flag_label: tk.Label | None = None
+
+        # サムネイル一覧
         self._grid_mode = False
         self._grid_btn = None
         self._grid_frame: tk.Frame | None = None
         self._grid_canvas: tk.Canvas | None = None
         self._thumb_images: list = []
         self._thumb_size = 150
+        self._canvas_bottom_sep: tk.Frame | None = None
         self._grid_cell_pos: dict = {}   # index → (x, y) キャンバス座標
         self._grid_load_job = None       # 段階的ロードの after ID
-        self._canvas_bottom_sep: tk.Frame | None = None
-
-        # モザイク機能
-        self._mosaic_mode = False
-        self._mosaic_start: tuple[int, int] | None = None
-        self._mosaic_rect = None
-        self._mosaic_strength = tk.IntVar(value=20)
-        self._display_info: tuple | None = None  # (scale, offset_x, offset_y, orig_w, orig_h)
-        self._mosaic_btn = None
-        self._mosaic_bar: tk.Frame | None = None
 
         self._build_ui()
         self.after(100, self._start)
@@ -430,14 +450,18 @@ class PhotoSorterApp(tk.Tk):
             side="right", padx=(6, 0))
         _make_btn(toolbar, "📸  Instagramリサイズ", self._resize_for_instagram).pack(
             side="right", padx=(6, 0))
-        self._grid_btn = _make_btn(toolbar, "⊞  グリッド", self._toggle_grid_mode)
-        self._grid_btn.pack(side="right", padx=(6, 0))
         self._mosaic_btn = _make_btn(toolbar, "🔲  モザイク", self._toggle_mosaic_mode)
         self._mosaic_btn.pack(side="right", padx=(6, 0))
+        self._crop_btn = _make_btn(toolbar, "✂  トリミング", self._toggle_crop_mode)
+        self._crop_btn.pack(side="right", padx=(6, 0))
         _separator(toolbar, vertical=True).pack(side="right", fill="y", pady=4, padx=4)
         _make_btn(toolbar, "↺", lambda: self._rotate_photo(90), padx=8).pack(side="right", padx=(2, 0))
         _make_btn(toolbar, "↻", lambda: self._rotate_photo(-90), padx=8).pack(side="right", padx=(2, 0))
         _make_btn(toolbar, "↔", self._flip_photo, padx=8).pack(side="right", padx=(2, 0))
+        _separator(toolbar, vertical=True).pack(side="right", fill="y", pady=4, padx=4)
+        self._grid_btn = _make_btn(toolbar, "⊞  グリッド", self._toggle_grid_mode)
+        self._grid_btn.pack(side="right", padx=(2, 0))
+        _make_btn(toolbar, "🗑  削除", self._delete_photo).pack(side="right", padx=(2, 6))
 
         # ── プログレスバー（3px線）──────────────
         _separator(self).pack(fill="x")
@@ -468,6 +492,21 @@ class PhotoSorterApp(tk.Tk):
             font=("", 8), fg=T_MUTED, bg=BG_SURFACE
         ).pack(side="left", padx=(12, 0))
 
+        # ── トリミングコントロールバー（トリミングモード時のみ表示）──
+        self._crop_bar = tk.Frame(self, bg="#1a2a1a", padx=16, pady=8)
+        tk.Label(
+            self._crop_bar, text="✂  トリミングモード：ドラッグして範囲を選択",
+            font=("", 9, "bold"), fg=T_PRIMARY, bg="#1a2a1a"
+        ).pack(side="left", padx=(0, 20))
+        tk.Label(
+            self._crop_bar, text="範囲を決定すると確認ダイアログが表示されます",
+            font=("", 9), fg=T_SECONDARY, bg="#1a2a1a"
+        ).pack(side="left")
+        tk.Label(
+            self._crop_bar, text="（クリックで解除）",
+            font=("", 8), fg=T_MUTED, bg="#1a2a1a"
+        ).pack(side="left", padx=(12, 0))
+
         # ── 画像キャンバス ──────────────────────
         self.canvas = tk.Canvas(self, bg=CANVAS_BG, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -475,7 +514,6 @@ class PhotoSorterApp(tk.Tk):
         self._canvas_bottom_sep.pack(fill="x")
 
         # ── ステータスバー（ファイル名・カウンタ）─
-        _separator(self).pack(fill="x")
         status = tk.Frame(self, bg=BG_SURFACE, pady=10)
         status.pack(fill="x")
 
@@ -491,6 +529,26 @@ class PhotoSorterApp(tk.Tk):
         )
         self.counter_label.pack(pady=(2, 0))
 
+        # ── 評価・フラグバー ────────────────────
+        rating_frame = tk.Frame(status, bg=BG_SURFACE)
+        rating_frame.pack(pady=(6, 0))
+        self._star_labels = []
+        for i in range(1, 6):
+            lbl = tk.Label(
+                rating_frame, text="☆", font=("", 16), fg=T_MUTED,
+                bg=BG_SURFACE, cursor="hand2", padx=1
+            )
+            lbl.pack(side="left")
+            lbl.bind("<Button-1>", lambda e, s=i: self._set_rating(s))
+            self._star_labels.append(lbl)
+        tk.Label(rating_frame, text="  ", bg=BG_SURFACE).pack(side="left")
+        self._flag_label = tk.Label(
+            rating_frame, text="🏳", font=("", 13), fg=T_MUTED,
+            bg=BG_SURFACE, cursor="hand2"
+        )
+        self._flag_label.pack(side="left", padx=(4, 0))
+        self._flag_label.bind("<Button-1>", lambda e: self._toggle_flag())
+
         # ── ショートカットバー ──────────────────
         _separator(self).pack(fill="x")
         self.shortcut_frame = tk.Frame(self, bg=BG_BASE, pady=10)
@@ -500,7 +558,7 @@ class PhotoSorterApp(tk.Tk):
         _separator(self).pack(fill="x")
         tk.Label(
             self,
-            text="←  →  前後に移動　　Ctrl+Z  元に戻す（仕分け・モザイク・回転/反転）　　ESC  終了",
+            text="←  →  前後に移動　　Ctrl+Z  元に戻す　　Delete  削除　　ESC  終了",
             font=("", 9), fg=T_MUTED, bg=BG_BASE, pady=7
         ).pack()
 
@@ -649,6 +707,7 @@ class PhotoSorterApp(tk.Tk):
         self.bind("<Right>",     lambda e: self._navigate(1))
         self.bind("<Control-z>", lambda e: self._undo_action())
         self.bind("<Control-Z>", lambda e: self._undo_action())
+        self.bind("<Delete>",    lambda e: self._delete_photo())
         self.bind("<Return>",    lambda e: self._grid_mode and self._grid_click(self.current_index))
         self.bind("<Escape>",    lambda e: self.destroy())
 
@@ -664,6 +723,11 @@ class PhotoSorterApp(tk.Tk):
 
         dst_dir = self.source_dir / folder_name
         dst = safe_move(src, dst_dir)
+
+        # 評価データを移動先パスに引き継ぐ
+        src_key = str(src)
+        if src_key in self._ratings:
+            self._ratings[str(dst)] = self._ratings.pop(src_key)
 
         self._undo_stack.append({"type": "sort", "src": src, "dst": dst, "index": self.current_index})
         self.sorted_count += 1
@@ -692,6 +756,12 @@ class PhotoSorterApp(tk.Tk):
                 return
 
             shutil.move(str(dst), str(src))
+
+            # 評価データを元のパスに戻す
+            dst_key = str(dst)
+            if dst_key in self._ratings:
+                self._ratings[str(src)] = self._ratings.pop(dst_key)
+
             self.photos.insert(idx, src)
             self.current_index = idx
             self.sorted_count -= 1
@@ -802,8 +872,6 @@ class PhotoSorterApp(tk.Tk):
         if not self.photos:
             if self._grid_mode:
                 self._exit_grid_mode()
-            self.canvas.delete("all")
-            self._photo_image = None
             self._show_done()
             return
 
@@ -812,10 +880,10 @@ class PhotoSorterApp(tk.Tk):
         self.counter_label.config(
             text=f"{idx} / {total}　　仕分け済み {self.sorted_count} 枚"
         )
-
         photo_path = self.photos[self.current_index]
         self.filename_label.config(text=photo_path.name)
         self.title(f"Photo Sorter — {photo_path.name}")
+        self._update_rating_bar()
 
         if self._grid_mode:
             self._build_grid()
@@ -823,7 +891,6 @@ class PhotoSorterApp(tk.Tk):
 
         self.canvas.delete("all")
         self._photo_image = None
-
         self.update_idletasks()
         cw = self.canvas.winfo_width()
         ch = self.canvas.winfo_height()
@@ -845,6 +912,7 @@ class PhotoSorterApp(tk.Tk):
             disp_w, disp_h = img.size
             offset_x = (cw - disp_w) // 2
             offset_y = (ch - disp_h) // 2
+            # 表示スケール（canvas座標→元画像座標の変換係数）
             scale = orig_w / disp_w
             self._display_info = (scale, offset_x, offset_y, orig_w, orig_h)
             self._photo_image = ImageTk.PhotoImage(img)
@@ -881,7 +949,86 @@ class PhotoSorterApp(tk.Tk):
                 fill=T_SECONDARY, font=("", 12), justify="center"
             )
 
-    # ── グリッド表示 ──────────────────────────────────────
+    # ── 共通ユーティリティ ────────────────────────────────────
+
+    def _save_image(self, img: "Image.Image", path: Path):
+        """フォーマットを維持して画像を上書き保存"""
+        suffix = path.suffix.lower()
+        if suffix in {".jpg", ".jpeg"}:
+            img.save(path, "JPEG", quality=95, subsampling=0)
+        elif suffix == ".png":
+            img.save(path, "PNG")
+        elif suffix == ".webp":
+            img.save(path, "WEBP", quality=95)
+        else:
+            img.save(path)
+
+    # ── 回転・反転 ────────────────────────────────────────────
+
+    def _rotate_photo(self, degrees: int):
+        """degrees: 90=右回転, -90=左回転"""
+        if not PIL_AVAILABLE or not self.photos:
+            return
+        photo_path = self.photos[self.current_index]
+        try:
+            backup = photo_path.read_bytes()
+            img = Image.open(photo_path)
+            img = ImageOps.exif_transpose(img)
+            rotated = img.rotate(-degrees, expand=True)
+            self._save_image(rotated, photo_path)
+            label = "↺ 左回転" if degrees == 90 else "↻ 右回転"
+            self._undo_stack.append({"type": "edit", "path": photo_path, "backup": backup, "label": label})
+            self._show_current()
+        except Exception as e:
+            messagebox.showerror("エラー", f"回転に失敗しました:\n{e}")
+
+    def _flip_photo(self):
+        """水平反転"""
+        if not PIL_AVAILABLE or not self.photos:
+            return
+        photo_path = self.photos[self.current_index]
+        try:
+            backup = photo_path.read_bytes()
+            img = Image.open(photo_path)
+            img = ImageOps.exif_transpose(img)
+            flipped = img.transpose(Image.FLIP_LEFT_RIGHT)
+            self._save_image(flipped, photo_path)
+            self._undo_stack.append({"type": "edit", "path": photo_path, "backup": backup, "label": "↔ 反転"})
+            self._show_current()
+        except Exception as e:
+            messagebox.showerror("エラー", f"反転に失敗しました:\n{e}")
+
+    # ── 削除（ゴミ箱）────────────────────────────────────────
+
+    def _delete_photo(self):
+        if not self.photos or self.current_index >= len(self.photos):
+            return
+        photo_path = self.photos[self.current_index]
+        confirmed = messagebox.askyesno(
+            "削除の確認",
+            f"このファイルをゴミ箱に送りますか？\n\n  {photo_path.name}",
+            icon="warning"
+        )
+        if not confirmed:
+            return
+        try:
+            if TRASH_AVAILABLE:
+                send2trash(str(photo_path))
+            else:
+                safe_move(photo_path, self.source_dir / "_deleted")
+
+            self.photos.pop(self.current_index)
+            if self.current_index >= len(self.photos) and self.current_index > 0:
+                self.current_index -= 1
+
+            self._show_toast("🗑  ゴミ箱に送りました")
+            self._update_progress()
+            self._show_current()
+        except Exception as e:
+            messagebox.showerror("エラー", f"削除に失敗しました:\n{e}")
+
+    # ── サムネイル一覧 ────────────────────────────────────────
+
     def _toggle_grid_mode(self):
         if not PIL_AVAILABLE:
             messagebox.showerror(
@@ -897,6 +1044,8 @@ class PhotoSorterApp(tk.Tk):
     def _enter_grid_mode(self):
         if self._mosaic_mode:
             self._exit_mosaic_mode()
+        if self._crop_mode:
+            self._exit_crop_mode()
 
         if self._grid_frame is None:
             self._grid_frame = tk.Frame(self, bg=CANVAS_BG)
@@ -919,11 +1068,7 @@ class PhotoSorterApp(tk.Tk):
         self._grid_btn.bind("<Enter>", lambda e: self._grid_btn.config(bg=ACCENT_HOV))
         self._grid_btn.bind("<Leave>", lambda e: self._grid_btn.config(bg=ACCENT))
         self.canvas.pack_forget()
-        if self._canvas_bottom_sep:
-            self._canvas_bottom_sep.pack_forget()
-        self._grid_frame.pack(fill="both", expand=True)
-        if self._canvas_bottom_sep:
-            self._canvas_bottom_sep.pack(fill="x")
+        self._grid_frame.pack(fill="both", expand=True, before=self._canvas_bottom_sep)
         self.after(50, self._build_grid)
 
     def _exit_grid_mode(self):
@@ -934,11 +1079,7 @@ class PhotoSorterApp(tk.Tk):
         self._grid_btn.bind("<Leave>", lambda e: self._grid_btn.config(bg=BG_WIDGET))
         if self._grid_frame:
             self._grid_frame.pack_forget()
-        if self._canvas_bottom_sep:
-            self._canvas_bottom_sep.pack_forget()
-        self.canvas.pack(fill="both", expand=True)
-        if self._canvas_bottom_sep:
-            self._canvas_bottom_sep.pack(fill="x")
+        self.canvas.pack(fill="both", expand=True, before=self._canvas_bottom_sep)
         self._show_current()
 
     def _cancel_grid_load(self):
@@ -1000,6 +1141,20 @@ class PhotoSorterApp(tk.Tk):
                 font=("", 8), tags=(tag,), width=thumb
             )
 
+            rating_info = self._ratings.get(str(photo_path), {})
+            stars = rating_info.get("stars", 0)
+            flagged = rating_info.get("flag", False)
+            badge_parts = []
+            if flagged:
+                badge_parts.append("🚩")
+            if stars:
+                badge_parts.append("★" * stars)
+            if badge_parts:
+                self._grid_canvas.create_text(
+                    x + thumb // 2, y + thumb + 26,
+                    text=" ".join(badge_parts), fill=AMBER, font=("", 8), tags=(tag,)
+                )
+
             self._grid_canvas.tag_bind(tag, "<Button-1>", lambda e, idx=i: self._grid_click(idx))
 
         rows = (len(self.photos) + cols - 1) // cols
@@ -1047,51 +1202,50 @@ class PhotoSorterApp(tk.Tk):
         self.current_index = index
         self._exit_grid_mode()
 
-    # ── 画像保存ユーティリティ ────────────────────────────
-    def _save_image(self, img: "Image.Image", path: Path):
-        suffix = path.suffix.lower()
-        if suffix in {".jpg", ".jpeg"}:
-            img.save(path, "JPEG", quality=95, subsampling=0)
-        elif suffix == ".png":
-            img.save(path, "PNG")
-        elif suffix == ".webp":
-            img.save(path, "WEBP", quality=95)
-        else:
-            img.save(path)
+    # ── 評価・フラグ ──────────────────────────────────────────
 
-    # ── 回転・反転 ────────────────────────────────────────
-    def _rotate_photo(self, degrees: int):
-        if not PIL_AVAILABLE or not self.photos:
+    def _set_rating(self, stars: int):
+        if not self.photos or self.current_index >= len(self.photos):
             return
-        photo_path = self.photos[self.current_index]
-        try:
-            backup = photo_path.read_bytes()
-            img = Image.open(photo_path)
-            img = ImageOps.exif_transpose(img)
-            rotated = img.rotate(-degrees, expand=True)
-            self._save_image(rotated, photo_path)
-            label = "↺ 左回転" if degrees == 90 else "↻ 右回転"
-            self._undo_stack.append({"type": "edit", "path": photo_path, "backup": backup, "label": label})
-            self._show_current()
-        except Exception as e:
-            messagebox.showerror("エラー", f"回転に失敗しました:\n{e}")
+        key = str(self.photos[self.current_index])
+        current = self._ratings.get(key, {})
+        current["stars"] = 0 if current.get("stars") == stars else stars
+        self._ratings[key] = current
+        self.config_data["ratings"] = self._ratings
+        save_config(self.config_data)
+        self._update_rating_bar()
 
-    def _flip_photo(self):
-        if not PIL_AVAILABLE or not self.photos:
+    def _toggle_flag(self):
+        if not self.photos or self.current_index >= len(self.photos):
             return
-        photo_path = self.photos[self.current_index]
-        try:
-            backup = photo_path.read_bytes()
-            img = Image.open(photo_path)
-            img = ImageOps.exif_transpose(img)
-            flipped = img.transpose(Image.FLIP_LEFT_RIGHT)
-            self._save_image(flipped, photo_path)
-            self._undo_stack.append({"type": "edit", "path": photo_path, "backup": backup, "label": "↔ 反転"})
-            self._show_current()
-        except Exception as e:
-            messagebox.showerror("エラー", f"反転に失敗しました:\n{e}")
+        key = str(self.photos[self.current_index])
+        current = self._ratings.get(key, {})
+        current["flag"] = not current.get("flag", False)
+        self._ratings[key] = current
+        self.config_data["ratings"] = self._ratings
+        save_config(self.config_data)
+        self._update_rating_bar()
+        msg = "🚩 フラグを設定しました" if current["flag"] else "🏳 フラグを解除しました"
+        self._show_toast(msg)
 
-    # ── モザイク機能 ──────────────────────────────────────
+    def _update_rating_bar(self):
+        if not self._star_labels:
+            return
+        stars, flagged = 0, False
+        if self.photos and self.current_index < len(self.photos):
+            info = self._ratings.get(str(self.photos[self.current_index]), {})
+            stars = info.get("stars", 0)
+            flagged = info.get("flag", False)
+        for i, lbl in enumerate(self._star_labels):
+            lbl.config(text="★" if i < stars else "☆", fg=AMBER if i < stars else T_MUTED)
+        if self._flag_label:
+            self._flag_label.config(
+                text="🚩" if flagged else "🏳",
+                fg="#ef4444" if flagged else T_MUTED
+            )
+
+    # ── モザイク機能 ──────────────────────────
+
     def _toggle_mosaic_mode(self):
         if not PIL_AVAILABLE:
             messagebox.showerror(
@@ -1106,14 +1260,17 @@ class PhotoSorterApp(tk.Tk):
             self._exit_mosaic_mode()
 
     def _enter_mosaic_mode(self):
+        # トリミングモードが有効なら解除
+        if self._crop_mode:
+            self._exit_crop_mode()
         self._mosaic_btn.config(bg="#7c3aed", text="🔲  モザイク解除")
         self._mosaic_btn.bind("<Enter>", lambda e: self._mosaic_btn.config(bg="#9333ea"))
         self._mosaic_btn.bind("<Leave>", lambda e: self._mosaic_btn.config(bg="#7c3aed"))
         self._mosaic_bar.pack(fill="x", after=self._prog_canvas)
         self.canvas.config(cursor="crosshair")
-        self.canvas.bind("<ButtonPress-1>",  self._mosaic_press)
-        self.canvas.bind("<B1-Motion>",       self._mosaic_move)
-        self.canvas.bind("<ButtonRelease-1>", self._mosaic_release)
+        self.canvas.bind("<ButtonPress-1>",   self._mosaic_press)
+        self.canvas.bind("<B1-Motion>",        self._mosaic_move)
+        self.canvas.bind("<ButtonRelease-1>",  self._mosaic_release)
 
     def _exit_mosaic_mode(self):
         self._mosaic_mode = False
@@ -1171,11 +1328,13 @@ class PhotoSorterApp(tk.Tk):
 
         scale, offset_x, offset_y, orig_w, orig_h = self._display_info
 
+        # canvas座標 → 元画像座標に変換
         ix0 = int((cx0 - offset_x) * scale)
         iy0 = int((cy0 - offset_y) * scale)
         ix1 = int((cx1 - offset_x) * scale)
         iy1 = int((cy1 - offset_y) * scale)
 
+        # 元画像の範囲内にクランプ
         ix0 = max(0, min(ix0, orig_w))
         iy0 = max(0, min(iy0, orig_h))
         ix1 = max(0, min(ix1, orig_w))
@@ -1194,12 +1353,14 @@ class PhotoSorterApp(tk.Tk):
 
             region = img.crop((ix0, iy0, ix1, iy1))
             rw, rh = region.size
+
+            # ピクセル化：縮小してから拡大
             small_w = max(1, rw // block_size)
             small_h = max(1, rh // block_size)
             small = region.resize((small_w, small_h), Image.BOX)
             pixelated = small.resize((rw, rh), Image.NEAREST)
-            img.paste(pixelated, (ix0, iy0))
 
+            img.paste(pixelated, (ix0, iy0))
             self._save_image(img, photo_path)
             self._undo_stack.append({"type": "edit", "path": photo_path, "backup": backup, "label": "🔲 モザイク"})
 
@@ -1212,6 +1373,144 @@ class PhotoSorterApp(tk.Tk):
 
         except Exception as e:
             messagebox.showerror("エラー", f"モザイクの適用に失敗しました:\n{e}")
+
+    # ── トリミング機能 ────────────────────────
+
+    def _toggle_crop_mode(self):
+        if not PIL_AVAILABLE:
+            messagebox.showerror(
+                "Pillowが必要です",
+                "この機能にはPillowが必要です。\n\n  pip install Pillow\n\nインストール後に再起動してください。"
+            )
+            return
+        self._crop_mode = not self._crop_mode
+        if self._crop_mode:
+            self._enter_crop_mode()
+        else:
+            self._exit_crop_mode()
+
+    def _enter_crop_mode(self):
+        # モザイクモードが有効なら解除
+        if self._mosaic_mode:
+            self._exit_mosaic_mode()
+        self._crop_btn.config(bg="#065f46", text="✂  トリミング解除")
+        self._crop_btn.bind("<Enter>", lambda e: self._crop_btn.config(bg="#047857"))
+        self._crop_btn.bind("<Leave>", lambda e: self._crop_btn.config(bg="#065f46"))
+        self._crop_bar.pack(fill="x", after=self._prog_canvas)
+        self.canvas.config(cursor="crosshair")
+        self.canvas.bind("<ButtonPress-1>",  self._crop_press)
+        self.canvas.bind("<B1-Motion>",       self._crop_move)
+        self.canvas.bind("<ButtonRelease-1>", self._crop_release)
+
+    def _exit_crop_mode(self):
+        self._crop_mode = False
+        self._crop_btn.config(bg=BG_WIDGET, text="✂  トリミング")
+        self._crop_btn.bind("<Enter>", lambda e: self._crop_btn.config(bg=BG_HOVER))
+        self._crop_btn.bind("<Leave>", lambda e: self._crop_btn.config(bg=BG_WIDGET))
+        self._crop_bar.pack_forget()
+        self.canvas.config(cursor="")
+        self.canvas.unbind("<ButtonPress-1>")
+        self.canvas.unbind("<B1-Motion>")
+        self.canvas.unbind("<ButtonRelease-1>")
+        if self._crop_rect:
+            self.canvas.delete(self._crop_rect)
+            self._crop_rect = None
+        self._crop_start = None
+
+    def _crop_press(self, event):
+        self._crop_start = (event.x, event.y)
+        if self._crop_rect:
+            self.canvas.delete(self._crop_rect)
+            self._crop_rect = None
+
+    def _crop_move(self, event):
+        if not self._crop_start:
+            return
+        if self._crop_rect:
+            self.canvas.delete(self._crop_rect)
+        x0, y0 = self._crop_start
+        self._crop_rect = self.canvas.create_rectangle(
+            x0, y0, event.x, event.y,
+            outline="#22c55e", width=2, dash=(6, 3)
+        )
+
+    def _crop_release(self, event):
+        if not self._crop_start:
+            return
+        x0, y0 = self._crop_start
+        x1, y1 = event.x, event.y
+        self._crop_start = None
+
+        rx0, rx1 = min(x0, x1), max(x0, x1)
+        ry0, ry1 = min(y0, y1), max(y0, y1)
+
+        if rx1 - rx0 < 5 or ry1 - ry0 < 5:
+            if self._crop_rect:
+                self.canvas.delete(self._crop_rect)
+                self._crop_rect = None
+            return
+
+        self._confirm_and_apply_crop(rx0, ry0, rx1, ry1)
+
+    def _confirm_and_apply_crop(self, cx0: int, cy0: int, cx1: int, cy1: int):
+        if not self._display_info or not self.photos:
+            return
+
+        scale, offset_x, offset_y, orig_w, orig_h = self._display_info
+
+        ix0 = int((cx0 - offset_x) * scale)
+        iy0 = int((cy0 - offset_y) * scale)
+        ix1 = int((cx1 - offset_x) * scale)
+        iy1 = int((cy1 - offset_y) * scale)
+
+        ix0 = max(0, min(ix0, orig_w))
+        iy0 = max(0, min(iy0, orig_h))
+        ix1 = max(0, min(ix1, orig_w))
+        iy1 = max(0, min(iy1, orig_h))
+
+        if ix1 <= ix0 or iy1 <= iy0:
+            return
+
+        crop_w = ix1 - ix0
+        crop_h = iy1 - iy0
+        photo_path = self.photos[self.current_index]
+
+        confirmed = messagebox.askyesno(
+            "トリミングの確認",
+            f"選択範囲にトリミングしますか？\n\n"
+            f"  サイズ: {crop_w} × {crop_h} px\n"
+            f"  ファイル: {photo_path.name}\n\n"
+            "この操作は元に戻せません。",
+            icon="warning"
+        )
+
+        if self._crop_rect:
+            self.canvas.delete(self._crop_rect)
+            self._crop_rect = None
+
+        if not confirmed:
+            return
+
+        try:
+            img = Image.open(photo_path)
+            img = ImageOps.exif_transpose(img)
+            cropped = img.crop((ix0, iy0, ix1, iy1))
+
+            suffix = photo_path.suffix.lower()
+            if suffix in {".jpg", ".jpeg"}:
+                cropped.save(photo_path, "JPEG", quality=95, subsampling=0)
+            elif suffix == ".png":
+                cropped.save(photo_path, "PNG")
+            elif suffix == ".webp":
+                cropped.save(photo_path, "WEBP", quality=95)
+            else:
+                cropped.save(photo_path)
+
+            self._show_current()
+            self._show_toast(f"✂  トリミング完了  {crop_w}×{crop_h}px")
+
+        except Exception as e:
+            messagebox.showerror("エラー", f"トリミングに失敗しました:\n{e}")
 
     def _show_done(self):
         self.filename_label.config(text="")
