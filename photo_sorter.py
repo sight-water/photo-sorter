@@ -386,7 +386,7 @@ class PhotoSorterApp(tk.Tk):
         self.sorted_count: int = 0
         self._total_original: int = 0
         self.rules: list[dict] = []
-        self._undo_stack: list[dict] = []  # {"src": Path, "dst": Path, "index": int}
+        self._undo_stack: list[dict] = []  # {"type": "sort"|"edit", ...}
         self._photo_image = None
         self._toast_window: tk.Toplevel | None = None
         self._toast_after_id = None
@@ -420,6 +420,8 @@ class PhotoSorterApp(tk.Tk):
         self._thumb_images: list = []
         self._thumb_size = 150
         self._canvas_bottom_sep: tk.Frame | None = None
+        self._grid_cell_pos: dict = {}   # index → (x, y) キャンバス座標
+        self._grid_load_job = None       # 段階的ロードの after ID
 
         self._build_ui()
         self.after(100, self._start)
@@ -703,8 +705,8 @@ class PhotoSorterApp(tk.Tk):
             self.bind(f"<KeyPress-{key.upper()}>", lambda e, n=name: self._sort_photo(n))
         self.bind("<Left>",      lambda e: self._navigate(-1))
         self.bind("<Right>",     lambda e: self._navigate(1))
-        self.bind("<Control-z>", lambda e: self._undo_sort())
-        self.bind("<Control-Z>", lambda e: self._undo_sort())
+        self.bind("<Control-z>", lambda e: self._undo_action())
+        self.bind("<Control-Z>", lambda e: self._undo_action())
         self.bind("<Delete>",    lambda e: self._delete_photo())
         self.bind("<Return>",    lambda e: self._grid_mode and self._grid_click(self.current_index))
         self.bind("<Escape>",    lambda e: self.destroy())
@@ -727,7 +729,7 @@ class PhotoSorterApp(tk.Tk):
         if src_key in self._ratings:
             self._ratings[str(dst)] = self._ratings.pop(src_key)
 
-        self._undo_stack.append({"src": src, "dst": dst, "index": self.current_index})
+        self._undo_stack.append({"type": "sort", "src": src, "dst": dst, "index": self.current_index})
         self.sorted_count += 1
         self.photos.pop(self.current_index)
         if self.current_index >= len(self.photos) and self.current_index > 0:
@@ -737,32 +739,49 @@ class PhotoSorterApp(tk.Tk):
         self._update_progress()
         self._show_current()
 
-    def _undo_sort(self):
+    def _undo_action(self):
         if not self._undo_stack:
             return
         entry = self._undo_stack.pop()
-        src: Path = entry["src"]
-        dst: Path = entry["dst"]
-        idx: int  = entry["index"]
+        entry_type = entry.get("type", "sort")
 
-        if not dst.exists():
-            self._undo_stack.clear()
-            messagebox.showwarning("元に戻せません", "移動先のファイルが見つかりません。\n外部で変更された可能性があります。")
-            return
+        if entry_type == "sort":
+            src: Path = entry["src"]
+            dst: Path = entry["dst"]
+            idx: int  = entry["index"]
 
-        shutil.move(str(dst), str(src))
+            if not dst.exists():
+                self._undo_stack.clear()
+                messagebox.showwarning("元に戻せません", "移動先のファイルが見つかりません。\n外部で変更された可能性があります。")
+                return
 
-        # 評価データを元のパスに戻す
-        dst_key = str(dst)
-        if dst_key in self._ratings:
-            self._ratings[str(src)] = self._ratings.pop(dst_key)
+            shutil.move(str(dst), str(src))
 
-        self.photos.insert(idx, src)
-        self.current_index = idx
-        self.sorted_count -= 1
-        self._update_progress()
-        self._show_toast_undo(f"↩  {src.name}")
-        self._show_current()
+            # 評価データを元のパスに戻す
+            dst_key = str(dst)
+            if dst_key in self._ratings:
+                self._ratings[str(src)] = self._ratings.pop(dst_key)
+
+            self.photos.insert(idx, src)
+            self.current_index = idx
+            self.sorted_count -= 1
+            self._update_progress()
+            self._show_toast_undo(f"↩  {src.name}")
+            self._show_current()
+
+        elif entry_type == "edit":
+            path: Path = entry["path"]
+            backup: bytes = entry["backup"]
+            label: str = entry["label"]
+
+            if not path.exists():
+                self._undo_stack.clear()
+                messagebox.showwarning("元に戻せません", "対象ファイルが見つかりません。\n外部で変更された可能性があります。")
+                return
+
+            path.write_bytes(backup)
+            self._show_toast_undo(f"↩  {label}")
+            self._show_current()
 
     def _show_toast_undo(self, message: str):
         """アンドゥ専用トースト（オレンジ色）"""
@@ -952,10 +971,13 @@ class PhotoSorterApp(tk.Tk):
             return
         photo_path = self.photos[self.current_index]
         try:
+            backup = photo_path.read_bytes()
             img = Image.open(photo_path)
             img = ImageOps.exif_transpose(img)
             rotated = img.rotate(-degrees, expand=True)
             self._save_image(rotated, photo_path)
+            label = "↺ 左回転" if degrees == 90 else "↻ 右回転"
+            self._undo_stack.append({"type": "edit", "path": photo_path, "backup": backup, "label": label})
             self._show_current()
         except Exception as e:
             messagebox.showerror("エラー", f"回転に失敗しました:\n{e}")
@@ -966,10 +988,12 @@ class PhotoSorterApp(tk.Tk):
             return
         photo_path = self.photos[self.current_index]
         try:
+            backup = photo_path.read_bytes()
             img = Image.open(photo_path)
             img = ImageOps.exif_transpose(img)
             flipped = img.transpose(Image.FLIP_LEFT_RIGHT)
             self._save_image(flipped, photo_path)
+            self._undo_stack.append({"type": "edit", "path": photo_path, "backup": backup, "label": "↔ 反転"})
             self._show_current()
         except Exception as e:
             messagebox.showerror("エラー", f"反転に失敗しました:\n{e}")
@@ -1048,6 +1072,7 @@ class PhotoSorterApp(tk.Tk):
         self.after(50, self._build_grid)
 
     def _exit_grid_mode(self):
+        self._cancel_grid_load()
         self._grid_mode = False
         self._grid_btn.config(bg=BG_WIDGET, text="⊞  グリッド")
         self._grid_btn.bind("<Enter>", lambda e: self._grid_btn.config(bg=BG_HOVER))
@@ -1057,12 +1082,19 @@ class PhotoSorterApp(tk.Tk):
         self.canvas.pack(fill="both", expand=True, before=self._canvas_bottom_sep)
         self._show_current()
 
+    def _cancel_grid_load(self):
+        if self._grid_load_job is not None:
+            self.after_cancel(self._grid_load_job)
+            self._grid_load_job = None
+
     def _build_grid(self):
         if not self._grid_canvas or not self._grid_mode:
             return
 
+        self._cancel_grid_load()
         self._grid_canvas.delete("all")
         self._thumb_images.clear()
+        self._grid_cell_pos.clear()
 
         if not self.photos:
             return
@@ -1075,12 +1107,16 @@ class PhotoSorterApp(tk.Tk):
         cell_h = thumb + 40
         cols = max(2, (gw - pad) // (thumb + pad))
 
+        # ── プレースホルダーを全件即時描画 ──
         for i, photo_path in enumerate(self.photos):
             col = i % cols
             row = i // cols
             x = pad + col * (thumb + pad)
             y = pad + row * (cell_h + pad)
             is_current = (i == self.current_index)
+
+            self._grid_cell_pos[i] = (x, y)
+            self._thumb_images.append(None)
 
             tag = f"cell_{i}"
             self._grid_canvas.create_rectangle(
@@ -1090,23 +1126,10 @@ class PhotoSorterApp(tk.Tk):
                 width=2 if is_current else 1,
                 tags=(tag,)
             )
-
-            try:
-                img = Image.open(photo_path)
-                img = ImageOps.exif_transpose(img)
-                img.thumbnail((thumb, thumb), Image.LANCZOS)
-                iw, ih = img.size
-                ix = x + (thumb - iw) // 2
-                iy = y + (thumb - ih) // 2
-                tk_img = ImageTk.PhotoImage(img)
-                self._thumb_images.append(tk_img)
-                self._grid_canvas.create_image(ix, iy, anchor="nw", image=tk_img, tags=(tag,))
-            except Exception:
-                self._thumb_images.append(None)
-                self._grid_canvas.create_text(
-                    x + thumb // 2, y + thumb // 2,
-                    text="読込失敗", fill=T_SECONDARY, font=("", 9), tags=(tag,)
-                )
+            self._grid_canvas.create_rectangle(
+                x, y, x + thumb, y + thumb,
+                fill=BG_RAISED, outline="", tags=(tag, f"ph_{i}")
+            )
 
             name = photo_path.name
             if len(name) > 18:
@@ -1142,6 +1165,38 @@ class PhotoSorterApp(tk.Tk):
             current_row = self.current_index // cols
             frac = current_row * (cell_h + pad) / max(total_h, 1)
             self._grid_canvas.yview_moveto(max(0.0, frac - 0.1))
+
+        # ── サムネイルを段階的にロード ──
+        self._grid_load_job = self.after(0, lambda: self._load_grid_thumb(0, cols, cell_h, pad))
+
+    def _load_grid_thumb(self, i: int, cols: int, cell_h: int, pad: int):
+        self._grid_load_job = None
+        if not self._grid_mode or not self._grid_canvas:
+            return
+        if i >= len(self.photos):
+            return
+
+        photo_path = self.photos[i]
+        x, y = self._grid_cell_pos[i]
+        thumb = self._thumb_size
+        tag = f"cell_{i}"
+
+        try:
+            img = Image.open(photo_path)
+            img = ImageOps.exif_transpose(img)
+            img.thumbnail((thumb, thumb), Image.LANCZOS)
+            iw, ih = img.size
+            ix = x + (thumb - iw) // 2
+            iy = y + (thumb - ih) // 2
+            tk_img = ImageTk.PhotoImage(img)
+            self._thumb_images[i] = tk_img
+            self._grid_canvas.delete(f"ph_{i}")
+            self._grid_canvas.create_image(ix, iy, anchor="nw", image=tk_img, tags=(tag,))
+            self._grid_canvas.tag_bind(tag, "<Button-1>", lambda e, idx=i: self._grid_click(idx))
+        except Exception:
+            pass
+
+        self._grid_load_job = self.after(0, lambda: self._load_grid_thumb(i + 1, cols, cell_h, pad))
 
     def _grid_click(self, index: int):
         self.current_index = index
@@ -1292,6 +1347,7 @@ class PhotoSorterApp(tk.Tk):
         photo_path = self.photos[self.current_index]
 
         try:
+            backup = photo_path.read_bytes()
             img = Image.open(photo_path)
             img = ImageOps.exif_transpose(img)
 
@@ -1305,16 +1361,8 @@ class PhotoSorterApp(tk.Tk):
             pixelated = small.resize((rw, rh), Image.NEAREST)
 
             img.paste(pixelated, (ix0, iy0))
-
-            suffix = photo_path.suffix.lower()
-            if suffix in {".jpg", ".jpeg"}:
-                img.save(photo_path, "JPEG", quality=95, subsampling=0)
-            elif suffix == ".png":
-                img.save(photo_path, "PNG")
-            elif suffix == ".webp":
-                img.save(photo_path, "WEBP", quality=95)
-            else:
-                img.save(photo_path)
+            self._save_image(img, photo_path)
+            self._undo_stack.append({"type": "edit", "path": photo_path, "backup": backup, "label": "🔲 モザイク"})
 
             if self._mosaic_rect:
                 self.canvas.delete(self._mosaic_rect)
