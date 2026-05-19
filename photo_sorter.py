@@ -383,6 +383,17 @@ class PhotoSorterApp(tk.Tk):
         self._toast_window: tk.Toplevel | None = None
         self._toast_after_id = None
 
+        # グリッド表示
+        self._grid_mode = False
+        self._grid_btn = None
+        self._grid_frame: tk.Frame | None = None
+        self._grid_canvas: tk.Canvas | None = None
+        self._thumb_images: list = []
+        self._thumb_size = 150
+        self._grid_cell_pos: dict = {}   # index → (x, y) キャンバス座標
+        self._grid_load_job = None       # 段階的ロードの after ID
+        self._canvas_bottom_sep: tk.Frame | None = None
+
         # モザイク機能
         self._mosaic_mode = False
         self._mosaic_start: tuple[int, int] | None = None
@@ -419,6 +430,8 @@ class PhotoSorterApp(tk.Tk):
             side="right", padx=(6, 0))
         _make_btn(toolbar, "📸  Instagramリサイズ", self._resize_for_instagram).pack(
             side="right", padx=(6, 0))
+        self._grid_btn = _make_btn(toolbar, "⊞  グリッド", self._toggle_grid_mode)
+        self._grid_btn.pack(side="right", padx=(6, 0))
         self._mosaic_btn = _make_btn(toolbar, "🔲  モザイク", self._toggle_mosaic_mode)
         self._mosaic_btn.pack(side="right", padx=(6, 0))
         _separator(toolbar, vertical=True).pack(side="right", fill="y", pady=4, padx=4)
@@ -458,6 +471,8 @@ class PhotoSorterApp(tk.Tk):
         # ── 画像キャンバス ──────────────────────
         self.canvas = tk.Canvas(self, bg=CANVAS_BG, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
+        self._canvas_bottom_sep = _separator(self)
+        self._canvas_bottom_sep.pack(fill="x")
 
         # ── ステータスバー（ファイル名・カウンタ）─
         _separator(self).pack(fill="x")
@@ -634,6 +649,7 @@ class PhotoSorterApp(tk.Tk):
         self.bind("<Right>",     lambda e: self._navigate(1))
         self.bind("<Control-z>", lambda e: self._undo_action())
         self.bind("<Control-Z>", lambda e: self._undo_action())
+        self.bind("<Return>",    lambda e: self._grid_mode and self._grid_click(self.current_index))
         self.bind("<Escape>",    lambda e: self.destroy())
 
     # ── 仕分け操作 ────────────────────────────
@@ -783,10 +799,11 @@ class PhotoSorterApp(tk.Tk):
     # ── 画像表示 ──────────────────────────────
 
     def _show_current(self):
-        self.canvas.delete("all")
-        self._photo_image = None
-
         if not self.photos:
+            if self._grid_mode:
+                self._exit_grid_mode()
+            self.canvas.delete("all")
+            self._photo_image = None
             self._show_done()
             return
 
@@ -799,6 +816,13 @@ class PhotoSorterApp(tk.Tk):
         photo_path = self.photos[self.current_index]
         self.filename_label.config(text=photo_path.name)
         self.title(f"Photo Sorter — {photo_path.name}")
+
+        if self._grid_mode:
+            self._build_grid()
+            return
+
+        self.canvas.delete("all")
+        self._photo_image = None
 
         self.update_idletasks()
         cw = self.canvas.winfo_width()
@@ -856,6 +880,172 @@ class PhotoSorterApp(tk.Tk):
                 text=f"画像を読み込めませんでした\n{e}",
                 fill=T_SECONDARY, font=("", 12), justify="center"
             )
+
+    # ── グリッド表示 ──────────────────────────────────────
+    def _toggle_grid_mode(self):
+        if not PIL_AVAILABLE:
+            messagebox.showerror(
+                "Pillowが必要です",
+                "この機能にはPillowが必要です。\n\n  pip install Pillow\n\nインストール後に再起動してください。"
+            )
+            return
+        if self._grid_mode:
+            self._exit_grid_mode()
+        else:
+            self._enter_grid_mode()
+
+    def _enter_grid_mode(self):
+        if self._mosaic_mode:
+            self._exit_mosaic_mode()
+
+        if self._grid_frame is None:
+            self._grid_frame = tk.Frame(self, bg=CANVAS_BG)
+            inner = tk.Frame(self._grid_frame, bg=CANVAS_BG)
+            inner.pack(fill="both", expand=True)
+            sb = tk.Scrollbar(inner, orient="vertical", bg=BG_RAISED, troughcolor=BG_BASE)
+            sb.pack(side="right", fill="y")
+            self._grid_canvas = tk.Canvas(
+                inner, bg=CANVAS_BG, highlightthickness=0, yscrollcommand=sb.set
+            )
+            self._grid_canvas.pack(side="left", fill="both", expand=True)
+            sb.config(command=self._grid_canvas.yview)
+            self._grid_canvas.bind(
+                "<MouseWheel>",
+                lambda e: self._grid_canvas.yview_scroll(-1 * (e.delta // 120), "units")
+            )
+
+        self._grid_mode = True
+        self._grid_btn.config(bg=ACCENT, text="⊞  1枚表示")
+        self._grid_btn.bind("<Enter>", lambda e: self._grid_btn.config(bg=ACCENT_HOV))
+        self._grid_btn.bind("<Leave>", lambda e: self._grid_btn.config(bg=ACCENT))
+        self.canvas.pack_forget()
+        if self._canvas_bottom_sep:
+            self._canvas_bottom_sep.pack_forget()
+        self._grid_frame.pack(fill="both", expand=True)
+        if self._canvas_bottom_sep:
+            self._canvas_bottom_sep.pack(fill="x")
+        self.after(50, self._build_grid)
+
+    def _exit_grid_mode(self):
+        self._cancel_grid_load()
+        self._grid_mode = False
+        self._grid_btn.config(bg=BG_WIDGET, text="⊞  グリッド")
+        self._grid_btn.bind("<Enter>", lambda e: self._grid_btn.config(bg=BG_HOVER))
+        self._grid_btn.bind("<Leave>", lambda e: self._grid_btn.config(bg=BG_WIDGET))
+        if self._grid_frame:
+            self._grid_frame.pack_forget()
+        if self._canvas_bottom_sep:
+            self._canvas_bottom_sep.pack_forget()
+        self.canvas.pack(fill="both", expand=True)
+        if self._canvas_bottom_sep:
+            self._canvas_bottom_sep.pack(fill="x")
+        self._show_current()
+
+    def _cancel_grid_load(self):
+        if self._grid_load_job is not None:
+            self.after_cancel(self._grid_load_job)
+            self._grid_load_job = None
+
+    def _build_grid(self):
+        if not self._grid_canvas or not self._grid_mode:
+            return
+
+        self._cancel_grid_load()
+        self._grid_canvas.delete("all")
+        self._thumb_images.clear()
+        self._grid_cell_pos.clear()
+
+        if not self.photos:
+            return
+
+        self._grid_canvas.update_idletasks()
+        gw = max(self._grid_canvas.winfo_width(), 600)
+
+        thumb = self._thumb_size
+        pad = 12
+        cell_h = thumb + 40
+        cols = max(2, (gw - pad) // (thumb + pad))
+
+        # ── プレースホルダーを全件即時描画 ──
+        for i, photo_path in enumerate(self.photos):
+            col = i % cols
+            row = i // cols
+            x = pad + col * (thumb + pad)
+            y = pad + row * (cell_h + pad)
+            is_current = (i == self.current_index)
+
+            self._grid_cell_pos[i] = (x, y)
+            self._thumb_images.append(None)
+
+            tag = f"cell_{i}"
+            self._grid_canvas.create_rectangle(
+                x - 3, y - 3, x + thumb + 3, y + cell_h + 3,
+                fill="#1e3a5f" if is_current else BG_RAISED,
+                outline=ACCENT if is_current else BORDER_CLR,
+                width=2 if is_current else 1,
+                tags=(tag,)
+            )
+            self._grid_canvas.create_rectangle(
+                x, y, x + thumb, y + thumb,
+                fill=BG_RAISED, outline="", tags=(tag, f"ph_{i}")
+            )
+
+            name = photo_path.name
+            if len(name) > 18:
+                name = name[:15] + "..."
+            self._grid_canvas.create_text(
+                x + thumb // 2, y + thumb + 9,
+                text=name,
+                fill=T_PRIMARY if is_current else T_SECONDARY,
+                font=("", 8), tags=(tag,), width=thumb
+            )
+
+            self._grid_canvas.tag_bind(tag, "<Button-1>", lambda e, idx=i: self._grid_click(idx))
+
+        rows = (len(self.photos) + cols - 1) // cols
+        total_h = rows * (cell_h + pad) + pad
+        self._grid_canvas.configure(scrollregion=(0, 0, gw, total_h))
+
+        if self.photos:
+            current_row = self.current_index // cols
+            frac = current_row * (cell_h + pad) / max(total_h, 1)
+            self._grid_canvas.yview_moveto(max(0.0, frac - 0.1))
+
+        # ── サムネイルを段階的にロード ──
+        self._grid_load_job = self.after(0, lambda: self._load_grid_thumb(0, cols, cell_h, pad))
+
+    def _load_grid_thumb(self, i: int, cols: int, cell_h: int, pad: int):
+        self._grid_load_job = None
+        if not self._grid_mode or not self._grid_canvas:
+            return
+        if i >= len(self.photos):
+            return
+
+        photo_path = self.photos[i]
+        x, y = self._grid_cell_pos[i]
+        thumb = self._thumb_size
+        tag = f"cell_{i}"
+
+        try:
+            img = Image.open(photo_path)
+            img = ImageOps.exif_transpose(img)
+            img.thumbnail((thumb, thumb), Image.LANCZOS)
+            iw, ih = img.size
+            ix = x + (thumb - iw) // 2
+            iy = y + (thumb - ih) // 2
+            tk_img = ImageTk.PhotoImage(img)
+            self._thumb_images[i] = tk_img
+            self._grid_canvas.delete(f"ph_{i}")
+            self._grid_canvas.create_image(ix, iy, anchor="nw", image=tk_img, tags=(tag,))
+            self._grid_canvas.tag_bind(tag, "<Button-1>", lambda e, idx=i: self._grid_click(idx))
+        except Exception:
+            pass
+
+        self._grid_load_job = self.after(0, lambda: self._load_grid_thumb(i + 1, cols, cell_h, pad))
+
+    def _grid_click(self, index: int):
+        self.current_index = index
+        self._exit_grid_mode()
 
     # ── 画像保存ユーティリティ ────────────────────────────
     def _save_image(self, img: "Image.Image", path: Path):
